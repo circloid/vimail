@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"veloci_mail/internal/auth"
-	"veloci_mail/internal/config"
-	"veloci_mail/internal/email"
-	"veloci_mail/internal/ui"
+	"vimail/internal/auth"
+	"vimail/internal/config"
+	"vimail/internal/email"
+	"vimail/internal/ui"
 
 	tea "github.com/charmbracelet/bubbletea"
 )

@@ -1,15 +1,15 @@
+// internal/ui/composer.go - Beautiful Zen Composer
 package ui
 
 import (
 	"context"
 	"strings"
-	"veloci_mail/internal/email"
+	"vimail/internal/email"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// ComposerField represents the current input field
 type ComposerField int
 
 const (
@@ -18,7 +18,6 @@ const (
 	BodyField
 )
 
-// ComposerModelImpl represents the email composition view state
 type ComposerModelImpl struct {
 	fromEmail    string
 	to           string
@@ -36,55 +35,33 @@ type ComposerModelImpl struct {
 	emailClient  *email.Client
 }
 
-// NewComposerModelImpl creates a new composer model
-func NewComposerModelImpl(fromEmail string) *ComposerModelImpl {
+func NewComposerModelImpl(fromEmail string, emailClient *email.Client) *ComposerModelImpl {
 	return &ComposerModelImpl{
 		fromEmail:    fromEmail,
 		currentField: ToField,
 		body:         []string{""},
 		bodyLine:     0,
 		cursorPos:    0,
+		emailClient:  emailClient,
 	}
 }
 
-// NewReplyComposerModelImpl creates a composer model for replying to a message
-func NewReplyComposerModelImpl(fromEmail string, originalMsg *email.Message) *ComposerModelImpl {
-	composer := NewComposerModelImpl(fromEmail)
+func NewReplyComposerModelImpl(fromEmail string, originalMsg *email.Message, emailClient *email.Client) *ComposerModelImpl {
+	composer := NewComposerModelImpl(fromEmail, emailClient)
 	composer.to = originalMsg.From
-	composer.subject = email.PrepareReplySubject(originalMsg.Subject)
-
-	// Add quoted original message
-	quotedBody := []string{
-		"",
-		"",
-		"On " + originalMsg.Date.Format("Mon, Jan 2, 2006 at 3:04 PM") + ", " + originalMsg.GetDisplayFrom() + " wrote:",
-		"",
-	}
-
-	// Quote each line of the original message
-	originalLines := strings.Split(originalMsg.Body, "\n")
-	for _, line := range originalLines {
-		quotedBody = append(quotedBody, "> "+line)
-	}
-
-	composer.body = quotedBody
-	composer.currentField = BodyField
-
+	composer.subject = "Re: " + originalMsg.Subject
 	return composer
 }
 
-// SendMessageMsg represents a message sending result
 type SendMessageMsg struct {
 	Success bool
 	Error   error
 }
 
-// Init initializes the composer model
 func (m *ComposerModelImpl) Init() tea.Cmd {
 	return nil
 }
 
-// Update handles composer-specific updates
 func (m *ComposerModelImpl) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.sending {
 		switch msg := msg.(type) {
@@ -109,8 +86,8 @@ func (m *ComposerModelImpl) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+s":
 			return m, m.sendMessage()
 
-		case "tab", "shift+tab":
-			m.nextField(msg.String() == "shift+tab")
+		case "tab":
+			m.nextField()
 
 		case "enter":
 			return m.handleEnter()
@@ -119,25 +96,35 @@ func (m *ComposerModelImpl) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleBackspace()
 
 		case "left":
-			return m.handleLeft()
+			if m.cursorPos > 0 {
+				m.cursorPos--
+			}
 
 		case "right":
-			return m.handleRight()
+			text := m.getCurrentFieldText()
+			if m.cursorPos < len(text) {
+				m.cursorPos++
+			}
 
 		case "up":
-			return m.handleUp()
+			if m.currentField == BodyField && m.bodyLine > 0 {
+				m.bodyLine--
+				newLineLen := len(m.body[m.bodyLine])
+				if m.cursorPos > newLineLen {
+					m.cursorPos = newLineLen
+				}
+			}
 
 		case "down":
-			return m.handleDown()
-
-		case "home":
-			m.cursorPos = 0
-
-		case "end":
-			m.cursorPos = len(m.getCurrentFieldText())
+			if m.currentField == BodyField && m.bodyLine < len(m.body)-1 {
+				m.bodyLine++
+				newLineLen := len(m.body[m.bodyLine])
+				if m.cursorPos > newLineLen {
+					m.cursorPos = newLineLen
+				}
+			}
 
 		default:
-			// Handle regular character input
 			if len(msg.String()) == 1 {
 				return m.handleCharInput(msg.String())
 			}
@@ -147,83 +134,62 @@ func (m *ComposerModelImpl) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the composer view
 func (m *ComposerModelImpl) View() string {
 	if m.sending {
-		return m.renderSending()
+		return lipgloss.NewStyle().
+			Foreground(White).
+			Align(lipgloss.Center, lipgloss.Center).
+			Width(m.width).
+			Height(m.height).
+			Render("✉ Sending...")
 	}
 
 	if m.err != nil {
-		return m.renderError()
+		return lipgloss.NewStyle().
+			Foreground(White).
+			Padding(2).
+			Render("✗ Error: " + m.err.Error() + "\n\nPress Esc to go back")
 	}
 
-	return m.renderComposer()
-}
-
-// renderSending renders the sending state
-func (m *ComposerModelImpl) renderSending() string {
-	return lipgloss.NewStyle().
-		Width(m.width).
-		Height(m.height).
-		Align(lipgloss.Center, lipgloss.Center).
-		Render("📤 Sending message...")
-}
-
-// renderError renders error state
-func (m *ComposerModelImpl) renderError() string {
-	errorContent := ErrorStyle.Render("Failed to send message: " + m.err.Error())
-
-	return lipgloss.NewStyle().
-		Width(m.width).
-		Height(m.height).
-		Align(lipgloss.Center, lipgloss.Center).
-		Render(errorContent)
-}
-
-// renderComposer renders the compose form
-func (m *ComposerModelImpl) renderComposer() string {
 	var sections []string
 
-	// From field (read-only)
-	fromSection := m.renderField("From:", m.fromEmail, false, false)
-	sections = append(sections, fromSection)
+	// Clean minimal form
+	sections = append(sections, m.renderField("To:", m.to, m.currentField == ToField))
+	sections = append(sections, "")
+	sections = append(sections, m.renderField("Subject:", m.subject, m.currentField == SubjectField))
+	sections = append(sections, "")
+	sections = append(sections, m.renderBodyField())
+	sections = append(sections, "")
 
-	// To field
-	toSection := m.renderField("To:", m.to, m.currentField == ToField, true)
-	sections = append(sections, toSection)
+	// Zen help text
+	help := lipgloss.NewStyle().
+		Foreground(Gray).
+		Align(lipgloss.Center).
+		Render("Tab: next field • Ctrl+S: send • Esc: cancel")
 
-	// Subject field
-	subjectSection := m.renderField("Subject:", m.subject, m.currentField == SubjectField, true)
-	sections = append(sections, subjectSection)
+	sections = append(sections, help)
 
-	// Body field
-	bodySection := m.renderBodyField()
-	sections = append(sections, bodySection)
-
-	content := lipgloss.JoinVertical(lipgloss.Left, sections...)
-
-	return BorderStyle.
-		Width(m.width-2).
-		Height(m.height-1).
-		Render(content)
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
-// renderField renders a single input field
-func (m *ComposerModelImpl) renderField(label, value string, focused, editable bool) string {
-	labelStyle := InputLabelStyle.Copy()
-	inputStyle := InputStyle.Copy()
+func (m *ComposerModelImpl) renderField(label, value string, focused bool) string {
+	labelStyle := lipgloss.NewStyle().
+		Foreground(Gray).
+		Width(10)
 
-	if focused && editable {
-		inputStyle = FocusedInputStyle.Copy()
-	}
+	inputStyle := lipgloss.NewStyle().
+		Foreground(White)
 
-	if !editable {
-		inputStyle = inputStyle.Foreground(MutedColor)
+	if focused {
+		labelStyle = labelStyle.Foreground(Blue)
+		inputStyle = inputStyle.
+			Border(lipgloss.NormalBorder(), false, false, true, false).
+			BorderForeground(Blue)
 	}
 
 	// Show cursor if focused
 	displayValue := value
-	if focused && editable {
+	if focused {
 		if m.cursorPos <= len(value) {
 			if m.cursorPos == len(value) {
 				displayValue = value + "█"
@@ -233,36 +199,34 @@ func (m *ComposerModelImpl) renderField(label, value string, focused, editable b
 		}
 	}
 
-	labelRendered := labelStyle.Render(label)
-	inputRendered := inputStyle.Width(m.width - 20).Render(displayValue)
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, labelRendered, " ", inputRendered)
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		labelStyle.Render(label),
+		" ",
+		inputStyle.Width(m.width-15).Render(displayValue),
+	)
 }
 
-// renderBodyField renders the multi-line body field
 func (m *ComposerModelImpl) renderBodyField() string {
-	labelStyle := InputLabelStyle.Copy()
+	labelStyle := lipgloss.NewStyle().
+		Foreground(Gray).
+		Width(10)
 
-	// Calculate available space
-	bodyHeight := m.height - 10 // Account for other fields and borders
+	if m.currentField == BodyField {
+		labelStyle = labelStyle.Foreground(Blue)
+	}
+
+	bodyHeight := m.height - 10
 	if bodyHeight < 3 {
 		bodyHeight = 3
 	}
 
 	var lines []string
-
-	// Show a subset of body lines based on current position
-	startLine := 0
-	if m.bodyLine >= bodyHeight-1 {
-		startLine = m.bodyLine - bodyHeight + 2
-	}
-
-	for i := 0; i < bodyHeight && startLine+i < len(m.body); i++ {
-		lineIndex := startLine + i
-		line := m.body[lineIndex]
+	for i := 0; i < bodyHeight && i < len(m.body); i++ {
+		line := m.body[i]
 
 		// Show cursor on current line if in body field
-		if m.currentField == BodyField && lineIndex == m.bodyLine {
+		if m.currentField == BodyField && i == m.bodyLine {
 			if m.cursorPos <= len(line) {
 				if m.cursorPos == len(line) {
 					line = line + "█"
@@ -275,53 +239,44 @@ func (m *ComposerModelImpl) renderBodyField() string {
 		lines = append(lines, line)
 	}
 
-	// Fill empty lines if needed
+	// Fill empty lines
 	for len(lines) < bodyHeight {
 		lines = append(lines, "")
 	}
 
-	bodyStyle := InputStyle.Copy()
+	bodyStyle := lipgloss.NewStyle().
+		Foreground(White).
+		Width(m.width - 15).
+		Height(bodyHeight)
+
 	if m.currentField == BodyField {
-		bodyStyle = FocusedInputStyle.Copy()
+		bodyStyle = bodyStyle.
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(Blue)
 	}
 
 	bodyContent := lipgloss.JoinVertical(lipgloss.Left, lines...)
-	bodyRendered := bodyStyle.
-		Width(m.width - 20).
-		Height(bodyHeight).
-		Render(bodyContent)
 
-	labelRendered := labelStyle.Render("Message:")
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, labelRendered, " ", bodyRendered)
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		labelStyle.Render("Message:"),
+		" ",
+		bodyStyle.Render(bodyContent),
+	)
 }
 
-// nextField moves to the next/previous input field
-func (m *ComposerModelImpl) nextField(reverse bool) {
-	if reverse {
-		switch m.currentField {
-		case BodyField:
-			m.currentField = SubjectField
-		case SubjectField:
-			m.currentField = ToField
-		case ToField:
-			m.currentField = BodyField
-		}
-	} else {
-		switch m.currentField {
-		case ToField:
-			m.currentField = SubjectField
-		case SubjectField:
-			m.currentField = BodyField
-		case BodyField:
-			m.currentField = ToField
-		}
+func (m *ComposerModelImpl) nextField() {
+	switch m.currentField {
+	case ToField:
+		m.currentField = SubjectField
+	case SubjectField:
+		m.currentField = BodyField
+	case BodyField:
+		m.currentField = ToField
 	}
-
 	m.cursorPos = len(m.getCurrentFieldText())
 }
 
-// getCurrentFieldText returns the text of the currently selected field
 func (m *ComposerModelImpl) getCurrentFieldText() string {
 	switch m.currentField {
 	case ToField:
@@ -337,10 +292,8 @@ func (m *ComposerModelImpl) getCurrentFieldText() string {
 	return ""
 }
 
-// handleEnter handles the Enter key
 func (m *ComposerModelImpl) handleEnter() (*ComposerModelImpl, tea.Cmd) {
 	if m.currentField == BodyField {
-		// Insert new line in body
 		currentLine := ""
 		if m.bodyLine < len(m.body) {
 			currentLine = m.body[m.bodyLine]
@@ -349,47 +302,35 @@ func (m *ComposerModelImpl) handleEnter() (*ComposerModelImpl, tea.Cmd) {
 		beforeCursor := currentLine[:m.cursorPos]
 		afterCursor := currentLine[m.cursorPos:]
 
-		// Update current line and insert new line
 		m.body[m.bodyLine] = beforeCursor
 		newLine := afterCursor
 
-		// Insert new line
 		m.body = append(m.body[:m.bodyLine+1], append([]string{newLine}, m.body[m.bodyLine+1:]...)...)
-
-		// Move to next line
 		m.bodyLine++
 		m.cursorPos = 0
 	} else {
-		// Move to next field
-		m.nextField(false)
+		m.nextField()
 	}
 
 	return m, nil
 }
 
-// handleBackspace handles the Backspace key
 func (m *ComposerModelImpl) handleBackspace() (*ComposerModelImpl, tea.Cmd) {
 	if m.currentField == BodyField {
 		if m.cursorPos > 0 {
-			// Remove character in current line
 			line := m.body[m.bodyLine]
 			m.body[m.bodyLine] = line[:m.cursorPos-1] + line[m.cursorPos:]
 			m.cursorPos--
 		} else if m.bodyLine > 0 {
-			// Join with previous line
 			prevLine := m.body[m.bodyLine-1]
 			currentLine := m.body[m.bodyLine]
 
-			// Remove current line
 			m.body = append(m.body[:m.bodyLine], m.body[m.bodyLine+1:]...)
-
-			// Update previous line
 			m.bodyLine--
 			m.body[m.bodyLine] = prevLine + currentLine
 			m.cursorPos = len(prevLine)
 		}
 	} else {
-		// Handle single-line fields
 		text := m.getCurrentFieldText()
 		if m.cursorPos > 0 {
 			newText := text[:m.cursorPos-1] + text[m.cursorPos:]
@@ -401,59 +342,13 @@ func (m *ComposerModelImpl) handleBackspace() (*ComposerModelImpl, tea.Cmd) {
 	return m, nil
 }
 
-// handleLeft handles the Left arrow key
-func (m *ComposerModelImpl) handleLeft() (*ComposerModelImpl, tea.Cmd) {
-	if m.cursorPos > 0 {
-		m.cursorPos--
-	}
-	return m, nil
-}
-
-// handleRight handles the Right arrow key
-func (m *ComposerModelImpl) handleRight() (*ComposerModelImpl, tea.Cmd) {
-	text := m.getCurrentFieldText()
-	if m.cursorPos < len(text) {
-		m.cursorPos++
-	}
-	return m, nil
-}
-
-// handleUp handles the Up arrow key
-func (m *ComposerModelImpl) handleUp() (*ComposerModelImpl, tea.Cmd) {
-	if m.currentField == BodyField && m.bodyLine > 0 {
-		m.bodyLine--
-		// Adjust cursor position to fit new line
-		newLineLen := len(m.body[m.bodyLine])
-		if m.cursorPos > newLineLen {
-			m.cursorPos = newLineLen
-		}
-	}
-	return m, nil
-}
-
-// handleDown handles the Down arrow key
-func (m *ComposerModelImpl) handleDown() (*ComposerModelImpl, tea.Cmd) {
-	if m.currentField == BodyField && m.bodyLine < len(m.body)-1 {
-		m.bodyLine++
-		// Adjust cursor position to fit new line
-		newLineLen := len(m.body[m.bodyLine])
-		if m.cursorPos > newLineLen {
-			m.cursorPos = newLineLen
-		}
-	}
-	return m, nil
-}
-
-// handleCharInput handles regular character input
 func (m *ComposerModelImpl) handleCharInput(char string) (*ComposerModelImpl, tea.Cmd) {
 	if m.currentField == BodyField {
-		// Insert character in body
 		line := m.body[m.bodyLine]
 		newLine := line[:m.cursorPos] + char + line[m.cursorPos:]
 		m.body[m.bodyLine] = newLine
 		m.cursorPos++
 	} else {
-		// Insert character in single-line field
 		text := m.getCurrentFieldText()
 		newText := text[:m.cursorPos] + char + text[m.cursorPos:]
 		m.setCurrentFieldText(newText)
@@ -463,7 +358,6 @@ func (m *ComposerModelImpl) handleCharInput(char string) (*ComposerModelImpl, te
 	return m, nil
 }
 
-// setCurrentFieldText sets the text of the currently selected field
 func (m *ComposerModelImpl) setCurrentFieldText(text string) {
 	switch m.currentField {
 	case ToField:
@@ -477,12 +371,10 @@ func (m *ComposerModelImpl) setCurrentFieldText(text string) {
 	}
 }
 
-// sendMessage creates a command to send the email
 func (m *ComposerModelImpl) sendMessage() tea.Cmd {
-	// Validate compose data
 	composeData := email.ComposeData{
 		To:      strings.TrimSpace(m.to),
-		Subject: email.SanitizeSubject(m.subject),
+		Subject: strings.TrimSpace(m.subject),
 		Body:    strings.Join(m.body, "\n"),
 	}
 
@@ -503,23 +395,15 @@ func (m *ComposerModelImpl) sendMessage() tea.Cmd {
 	}
 }
 
-// SetSize updates the size of the composer view
 func (m *ComposerModelImpl) SetSize(width, height int) {
 	m.width = width
 	m.height = height
 }
 
-// SetEmailClient sets the email client for sending messages
-func (m *ComposerModelImpl) SetEmailClient(client *email.Client) {
-	m.emailClient = client
-}
-
-// IsSent returns whether the message was sent
 func (m *ComposerModelImpl) IsSent() bool {
 	return m.Sent
 }
 
-// IsCancelled returns whether composition was cancelled
 func (m *ComposerModelImpl) IsCancelled() bool {
 	return m.Cancelled
 }

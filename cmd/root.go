@@ -23,6 +23,6 @@ var RootCmd = struct {
 	Use   string
 	Short string
 }{
-	Use:   "veloci_mail",
+	Use:   "vimail",
 	Short: "A fast terminal email client",
 }
